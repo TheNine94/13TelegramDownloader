@@ -29,37 +29,51 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y curl jq zip openssl
+          
+- name: 🔢 Generate post links
+  id: generate_links
+  run: |
+    BASE_LINK="${{ github.event.inputs.telegram_link }}"
+    
+    mkdir -p links
+    
+    echo "Generating telegram post links..."
+    
+    for i in $(seq 1 1000); do
+      echo "$BASE_LINK/$i" >> links/list.txt
+    done
+    
+    echo "total=$(wc -l < links/list.txt)" >> $GITHUB_OUTPUT
 
-      - name: 📡 Get direct link and fix spaces
-        id: get_link
-        run: |
-          TELEGRAM_LINK="${{ github.event.inputs.telegram_link }}"
-          
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "🔗 Telegram link: $TELEGRAM_LINK"
-          echo "═══════════════════════════════════════════════════════════════"
-          
-          RESPONSE=$(curl -s -X POST \
-            -H "User-Agent: Mozilla/5.0" \
-            -d "telegram_link=$TELEGRAM_LINK" \
-            https://telegramdownloader.net/proxy.php)
-          
-          RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
-          FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
-          
-          if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
-            echo "❌ Error: Could not get download link!"
-            exit 1
-          fi
-          
-          # Convert spaces to dash in URL
-          CORRECTED_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
-          
-          echo "✅ Direct link received!"
-          echo "📄 Original filename: $FILE_NAME"
-          
-          echo "download_url=$CORRECTED_URL" >> $GITHUB_OUTPUT
-          echo "original_name=$FILE_NAME" >> $GITHUB_OUTPUT
+      - name: 📡 Process all posts
+  run: |
+    while read TELEGRAM_LINK; do
+      
+      echo "Processing: $TELEGRAM_LINK"
+      
+      RESPONSE=$(curl -s -X POST \
+        -H "User-Agent: Mozilla/5.0" \
+        -d "telegram_link=$TELEGRAM_LINK" \
+        https://telegramdownloader.net/proxy.php)
+      
+      RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
+      FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
+      
+      if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
+        echo "Skipping invalid post"
+        continue
+      fi
+      
+      CORRECTED_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
+      
+      mkdir -p downloads
+      
+      curl -L \
+        -o "downloads/$FILE_NAME" \
+        "$CORRECTED_URL"
+      
+    done < links/list.txt
+
 
       - name: ⬇️ Download file with duplicate check
         id: download
