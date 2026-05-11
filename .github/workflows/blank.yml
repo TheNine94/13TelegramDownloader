@@ -1,17 +1,17 @@
-name: TelegramChannelDownloader
+name: Telegram Channel Downloader
 
 on:
   workflow_dispatch:
     inputs:
       telegram_channel:
-        description: "Telegram channel link"
+        description: "Telegram channel link or username"
         required: true
         type: string
       split_threshold_mb:
         description: "Max size per part (MB) | 0 = disable"
         required: false
-        type: number
         default: 90
+        type: number
 
 jobs:
   download:
@@ -21,160 +21,149 @@ jobs:
 
     steps:
 
-      - name: Clone repository
+      - name: 📦 Checkout
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install dependencies
+      - name: 🔧 Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y curl jq zip openssl
 
-      - name: Detect last post id (via t.me/s)
-  id: lastpost
-  run: |
-    set -e
-
-    CHANNEL_INPUT="${{ github.event.inputs.telegram_channel }}"
-
-    # Extract channel username from inputs like:
-    # https://t.me/herbsandhealing
-    # https://t.me/s/herbsandhealing
-    # herbsandhealing
-    CHANNEL=$(echo "$CHANNEL_INPUT" | sed -E 's#https?://t\.me/(s/)?##' | sed 's#/.*##' | tr -d '@')
-
-    if [ -z "$CHANNEL" ]; then
-      echo "Invalid channel input"
-      exit 1
-    fi
-
-    URL="https://t.me/s/$CHANNEL"
-    echo "Fetching: $URL"
-
-    HTML=$(curl -fsSL -H "User-Agent: Mozilla/5.0" "$URL")
-
-    LAST=$(echo "$HTML" | grep -oE 'data-post="'"$CHANNEL"'/[0-9]+"' | tail -1 | sed -E 's#.*\/([0-9]+)"#\1#')
-
-    if [ -z "$LAST" ]; then
-      echo "Failed to detect last post (channel may be private / restricted / empty)"
-      exit 1
-    fi
-
-    echo "Last post id: $LAST"
-    echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
-    echo "last_post=$LAST" >> $GITHUB_OUTPUT
-
-
-      - name: Download channel posts
-        id: download
+      - name: 🔍 Detect channel & last post
+        id: detect
         run: |
+          set -e
 
-          BASE="${{ github.event.inputs.telegram_channel }}"
-          LAST="${{ steps.lastpost.outputs.last_post }}"
+          INPUT="${{ github.event.inputs.telegram_channel }}"
+
+          CHANNEL=$(echo "$INPUT" \
+            | sed -E 's#https?://t\.me/(s/)?##' \
+            | sed 's#/.*##' \
+            | tr -d '@')
+
+          if [ -z "$CHANNEL" ]; then
+            echo "❌ Invalid channel input"
+            exit 1
+          fi
+
+          echo "✅ Channel: $CHANNEL"
+
+          URL="https://t.me/s/$CHANNEL"
+          HTML=$(curl -fsSL -H "User-Agent: Mozilla/5.0" "$URL")
+
+          LAST=$(echo "$HTML" \
+            | grep -oE 'data-post="'"$CHANNEL"'/[0-9]+"' \
+            | tail -1 \
+            | sed -E 's#.*\/([0-9]+)"#\1#')
+
+          if [ -z "$LAST" ]; then
+            echo "❌ Failed to detect last post (private or restricted channel)"
+            exit 1
+          fi
+
+          echo "✅ Last post ID: $LAST"
+
+          echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
+          echo "last_post=$LAST" >> $GITHUB_OUTPUT
+
+      - name: ⬇️ Download all posts
+        run: |
+          set -e
+
+          CHANNEL="${{ steps.detect.outputs.channel }}"
+          LAST="${{ steps.detect.outputs.last_post }}"
+          BASE="https://t.me/$CHANNEL"
 
           mkdir -p downloads
 
-          echo "Downloading posts 1 → $LAST"
+          for ((i=1; i<=LAST; i++)); do
+            POST="$BASE/$i"
+            echo "➡️ $POST"
 
-          for (( i=1; i<=LAST; i++ ))
-          do
-            LINK="$BASE/$i"
-            
-            echo "Processing $LINK"
-            
             RESPONSE=$(curl -s -X POST \
               -H "User-Agent: Mozilla/5.0" \
-              -d "telegram_link=$LINK" \
+              -d "telegram_link=$POST" \
               https://telegramdownloader.net/proxy.php)
 
-            RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
-            FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
+            URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
+            NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
 
-            if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
-              echo "No file in post $i"
+            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+              echo "   ⏭️ No file"
               continue
             fi
 
-            CORRECTED_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
+            URL=$(echo "$URL" | sed 's/%20/-/g;s/ /-/g')
 
-            BASE_NAME="${FILE_NAME%.*}"
-            EXT="${FILE_NAME##*.}"
+            BASE_NAME="${NAME%.*}"
+            EXT="${NAME##*.}"
+            FINAL="$NAME"
+            N=1
 
-            FINAL_NAME="$FILE_NAME"
-            COUNT=1
-
-            while [ -f "downloads/$FINAL_NAME" ]; do
-              FINAL_NAME="${BASE_NAME}_${COUNT}.${EXT}"
-              COUNT=$((COUNT+1))
+            while [ -f "downloads/$FINAL" ]; do
+              FINAL="${BASE_NAME}_$N.$EXT"
+              N=$((N+1))
             done
 
-            echo "Downloading $FINAL_NAME"
+            echo "   ⬇️ Downloading $FINAL"
 
             curl -L \
               --retry 5 \
               --retry-delay 5 \
-              -o "downloads/$FINAL_NAME" \
-              "$CORRECTED_URL"
-
+              -o "downloads/$FINAL" \
+              "$URL"
           done
 
-      - name: Split large files
+      - name: ✂️ Split large files
         if: github.event.inputs.split_threshold_mb != '0'
         run: |
-          THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
-          LIMIT=$((THRESHOLD * 1024 * 1024))
-
+          LIMIT=$(( ${{ github.event.inputs.split_threshold_mb }} * 1024 * 1024 ))
           cd downloads
 
-          for file in *; do
-            [ -f "$file" ] || continue
-
-            SIZE=$(stat -c%s "$file")
+          for f in *; do
+            [ -f "$f" ] || continue
+            SIZE=$(stat -c%s "$f")
 
             if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "Splitting $file"
-              zip -s "${THRESHOLD}m" "$file.zip" "$file"
-              rm "$file"
+              echo "✂️ Splitting $f"
+              zip -s "${{ github.event.inputs.split_threshold_mb }}m" "$f.zip" "$f"
+              rm "$f"
             fi
           done
-
           cd ..
 
-      - name: Clean filenames
+      - name: 🧹 Clean filenames
         run: |
           cd downloads
+          for f in *; do
+            [ -e "$f" ] || continue
+            EXT="${f##*.}"
 
-          for file in *; do
-            [ -e "$file" ] || continue
-
-            EXT="${file##*.}"
-
-            if [[ "$file" =~ [^[:ascii:]] ]]; then
+            if [[ "$f" =~ [^[:ascii:]] ]]; then
               NEW=$(openssl rand -hex 8).$EXT
-              mv "$file" "$NEW"
+              mv "$f" "$NEW"
             else
-              CLEAN=$(echo "$file" | sed 's/[^a-zA-Z0-9._-]/_/g')
-              mv "$file" "$CLEAN"
+              CLEAN=$(echo "$f" | sed 's/[^a-zA-Z0-9._-]/_/g')
+              mv "$f" "$CLEAN"
             fi
           done
-
           cd ..
 
-      - name: Upload files to repo
+      - name: 📤 Upload to repository
         run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
 
-          for file in downloads/*; do
-            [ -f "$file" ] || continue
-
-            git add "$file"
-            git commit -m "Add $(basename "$file") [skip ci]" || true
+          for f in downloads/*; do
+            [ -f "$f" ] || continue
+            git add "$f"
+            git commit -m "Add $(basename "$f") [skip ci]" || true
             git push
           done
 
-      - name: Final report
+      - name: ✅ Final report
         run: |
-          echo "Download finished"
+          echo "🎉 Done"
           ls -lh downloads
