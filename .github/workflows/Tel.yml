@@ -1,0 +1,191 @@
+name: TelegramDownloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_link:
+        description: '🔗 Telegram channel or post link'
+        required: true
+        type: string
+      split_threshold_mb:
+        description: '📦 Maximum file size per part (MB)'
+        required: false
+        type: number
+        default: 90
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: 📂 Clone repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔧 Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq zip openssl
+
+      # ✅ تشخیص کانال و آخرین پست
+      - name: 🔎 Detect channel & last post
+        id: detect
+        run: |
+          INPUT="${{ github.event.inputs.telegram_link }}"
+
+          CHANNEL=$(echo "$INPUT" \
+            | sed -E 's#https?://t\.me/(s/)?##' \
+            | sed 's#/.*##' \
+            | tr -d '@')
+
+          echo "✅ Channel detected: $CHANNEL"
+
+          HTML=$(curl -s -H "User-Agent: Mozilla/5.0" https://t.me/s/$CHANNEL)
+
+          LAST=$(echo "$HTML" \
+            | grep -oE 'data-post="'"$CHANNEL"'/[0-9]+"' \
+            | tail -1 \
+            | sed -E 's#.*\/([0-9]+)"#\1#')
+
+          if [ -z "$LAST" ]; then
+            echo "❌ Failed to detect last post"
+            exit 1
+          fi
+
+          echo "✅ Last post id: $LAST"
+
+          echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
+          echo "last_post=$LAST" >> $GITHUB_OUTPUT
+
+      # ✅ دانلود همه پست‌ها
+      - name: ⬇️ Download posts
+        run: |
+          CHANNEL="${{ steps.detect.outputs.channel }}"
+          LAST="${{ steps.detect.outputs.last_post }}"
+
+          mkdir -p downloads
+
+          for ((i=1;i<=LAST;i++)); do
+
+            TELEGRAM_LINK="https://t.me/$CHANNEL/$i"
+
+            echo "═══════════════════════════════════════════════════════════════"
+            echo "🔗 Processing: $TELEGRAM_LINK"
+            echo "═══════════════════════════════════════════════════════════════"
+
+            RESPONSE=$(curl -s -X POST \
+              -H "User-Agent: Mozilla/5.0" \
+              -d "telegram_link=$TELEGRAM_LINK" \
+              https://telegramdownloader.net/proxy.php)
+
+            RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
+            FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
+
+            if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
+              echo "⏭️ No file in this post"
+              continue
+            fi
+
+            CORRECTED_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
+
+            BASE_NAME="${FILE_NAME%.*}"
+            EXT="${FILE_NAME##*.}"
+
+            if [[ "$EXT" == "$FILE_NAME" ]]; then
+              EXT=""
+            else
+              EXT=".$EXT"
+            fi
+
+            FINAL_NAME="$FILE_NAME"
+            COUNTER=1
+
+            while [ -f "downloads/$FINAL_NAME" ]; do
+              FINAL_NAME="${BASE_NAME}_${COUNTER}${EXT}"
+              COUNTER=$((COUNTER + 1))
+            done
+
+            echo "⬇️ Downloading: $FINAL_NAME"
+
+            curl -L --progress-bar \
+              --max-time 7200 \
+              --retry 10 \
+              --retry-delay 10 \
+              -C - \
+              -H "User-Agent: Mozilla/5.0" \
+              -H "Referer: https://telegramdownloader.net/" \
+              -o "downloads/$FINAL_NAME" \
+              "$CORRECTED_URL"
+
+            SIZE=$(stat -c%s "downloads/$FINAL_NAME" || echo 0)
+
+            if [ "$SIZE" -lt 1024 ]; then
+              echo "❌ Invalid file"
+              rm -f "downloads/$FINAL_NAME"
+            fi
+
+          done
+
+      - name: ✂️ Split large file
+        if: github.event.inputs.split_threshold_mb != '0'
+        run: |
+          THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
+          LIMIT=$((THRESHOLD * 1024 * 1024))
+
+          cd downloads
+
+          for FILE in *; do
+            [ -f "$FILE" ] || continue
+
+            SIZE=$(stat -c%s "$FILE")
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "✂️ Splitting $FILE"
+              zip -s "${THRESHOLD}m" "$FILE.zip" "$FILE"
+              rm "$FILE"
+            fi
+          done
+
+          cd ..
+
+      - name: 🔄 Fix filenames
+        run: |
+          cd downloads
+
+          for file in *; do
+            [ -e "$file" ] || continue
+
+            EXT="${file##*.}"
+
+            if [[ "$file" =~ [^[:ascii:]] ]]; then
+              RANDOM_NAME=$(openssl rand -hex 8)
+              NEW_NAME="${RANDOM_NAME}.${EXT}"
+              mv "$file" "$NEW_NAME"
+            else
+              CLEAN_NAME=$(echo "$file" | sed 's/[^a-zA-Z0-9._-]/_/g')
+              mv "$file" "$CLEAN_NAME"
+            fi
+          done
+
+          cd ..
+
+      - name: 📤 Upload to GitHub
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          for file in downloads/*; do
+            [ -f "$file" ] || continue
+            git add "$file"
+            git commit -m "Add $(basename $file) [skip ci]" || true
+            git push
+          done
+
+      - name: 📋 Final report
+        if: always()
+        run: |
+          echo "✅ Download finished"
+          ls -lh downloads/
