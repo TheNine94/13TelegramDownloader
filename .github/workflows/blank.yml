@@ -31,25 +31,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y curl jq zip openssl
 
-      - name: Detect last post id
-        id: lastpost
-        run: |
-          CHANNEL="${{ github.event.inputs.telegram_channel }}"
-          
-          echo "Checking channel..."
-          
-          HTML=$(curl -s "$CHANNEL")
-          
-          LAST=$(echo "$HTML" | grep -o 'data-post="[^"]*"' | tail -1 | sed 's/.*\///;s/"//')
-          
-          if [ -z "$LAST" ]; then
-            echo "Failed to detect last post"
-            exit 1
-          fi
-          
-          echo "Last post id: $LAST"
-          
-          echo "last_post=$LAST" >> $GITHUB_OUTPUT
+      - name: Detect last post id (via t.me/s)
+  id: lastpost
+  run: |
+    set -e
+
+    CHANNEL_INPUT="${{ github.event.inputs.telegram_channel }}"
+
+    # Extract channel username from inputs like:
+    # https://t.me/herbsandhealing
+    # https://t.me/s/herbsandhealing
+    # herbsandhealing
+    CHANNEL=$(echo "$CHANNEL_INPUT" | sed -E 's#https?://t\.me/(s/)?##' | sed 's#/.*##' | tr -d '@')
+
+    if [ -z "$CHANNEL" ]; then
+      echo "Invalid channel input"
+      exit 1
+    fi
+
+    URL="https://t.me/s/$CHANNEL"
+    echo "Fetching: $URL"
+
+    HTML=$(curl -fsSL -H "User-Agent: Mozilla/5.0" "$URL")
+
+    LAST=$(echo "$HTML" | grep -oE 'data-post="'"$CHANNEL"'/[0-9]+"' | tail -1 | sed -E 's#.*\/([0-9]+)"#\1#')
+
+    if [ -z "$LAST" ]; then
+      echo "Failed to detect last post (channel may be private / restricted / empty)"
+      exit 1
+    fi
+
+    echo "Last post id: $LAST"
+    echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
+    echo "last_post=$LAST" >> $GITHUB_OUTPUT
+
 
       - name: Download channel posts
         id: download
